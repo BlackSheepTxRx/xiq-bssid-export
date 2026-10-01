@@ -19,8 +19,8 @@ interfaces. See ``AI.md`` for an assistant setting this up on a new machine.
 
 Verification
 ------------
-Confirmed against ``show interface`` on AP-EXAMPLE-01 (XXXXXXXXXXXXXX):
-``wifi1.0`` is ``aa:bb:cc:00:00:60`` and ``wifi1.1`` is ``aa:bb:cc:00:00:64``.
+For a base of ``aa:bb:cc:00:00:60``, ``wifi1.0`` is that address and
+``wifi1.1`` is ``aa:bb:cc:00:00:64``. ``wifi1.2`` is ``aa:bb:cc:00:00:65``.
 """
 
 from __future__ import annotations
@@ -75,6 +75,7 @@ COLUMNS = (
     "SSID Status",
     "Network Policy",
     "Location Source",
+    "Status",
 )
 
 _HEX_MAC = re.compile(r"[^0-9a-f]")
@@ -197,6 +198,7 @@ def row_sort_key(row: Mapping[str, str]) -> tuple[Any, ...]:
     index_text = row["WLAN Index"]
     index = int(index_text) if index_text else -1
     return (
+        row["Site"] == UNASSIGNED_SITE,
         row["Site"].casefold(),
         blank_first(row["Building"]),
         (row["Floor"] != "", natural_key(row["Floor"])),
@@ -305,13 +307,34 @@ def default_settings() -> dict[str, Any]:
     }
 
 
+def script_directory() -> str:
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def resolve_default_config(path: str) -> str:
+    """Find the default config.json in the working directory, then beside the script."""
+    if os.path.normcase(os.path.normpath(path)) != os.path.normcase(
+        os.path.normpath(DEFAULT_CONFIG_PATH)
+    ):
+        return path
+    if os.path.isfile(path):
+        return path
+    beside_script = os.path.join(script_directory(), os.path.basename(path))
+    if os.path.isfile(beside_script):
+        return beside_script
+    return path
+
+
 def load_config(path: str) -> dict[str, Any]:
     """Read config.json. A missing default file falls back to wifi1.0."""
     settings = default_settings()
     if not os.path.isfile(path):
-        if os.path.normcase(os.path.normpath(path)) == os.path.normcase(
-            os.path.normpath(DEFAULT_CONFIG_PATH)
-        ):
+        requested = os.path.normcase(os.path.normpath(path))
+        default_name = os.path.normcase(os.path.normpath(DEFAULT_CONFIG_PATH))
+        beside_script = os.path.normcase(
+            os.path.abspath(os.path.join(script_directory(), DEFAULT_CONFIG_PATH))
+        )
+        if requested in {default_name, beside_script}:
             eprint(f"{path} not found; using {DEFAULT_INTERFACE}")
             return settings
         raise SystemExit(f"config file not found: {path}")
@@ -354,10 +377,8 @@ def load_config(path: str) -> dict[str, Any]:
     return settings
 
 
-def load_dotenv(path: str = ".env") -> None:
-    """Fill unset XIQ_* variables from .env. Values are never printed."""
-    if not os.path.isfile(path):
-        return
+def _load_dotenv_file(path: str) -> None:
+    """Fill unset XIQ_* variables from one file. Values are never printed."""
     try:
         lines = open(path, encoding="utf-8").read().splitlines()
     except OSError as exc:
@@ -373,6 +394,24 @@ def load_dotenv(path: str = ".env") -> None:
         if os.environ.get(key, "").strip():
             continue
         os.environ[key] = value.strip().strip('"').strip("'")
+
+
+def load_dotenv(script_dir: str | None = None) -> None:
+    """Read .env from the working directory, then from the script directory.
+
+    An environment variable that is already set is left unchanged, so the
+    working directory wins over the script directory.
+    """
+    directories = [os.getcwd()]
+    script_dir = script_dir or script_directory()
+    if os.path.normcase(os.path.abspath(script_dir)) != os.path.normcase(
+        os.path.abspath(os.getcwd())
+    ):
+        directories.append(script_dir)
+    for directory in directories:
+        path = os.path.join(directory, ".env")
+        if os.path.isfile(path):
+            _load_dotenv_file(path)
 
 
 def interface_warning(choices: Sequence[InterfaceChoice]) -> str:
@@ -845,6 +884,7 @@ def _base_row(ap: Mapping[str, Any]) -> dict[str, str]:
         "SSID Status": "",
         "Network Policy": "",
         "Location Source": ap["location_source"],
+        "Status": "",
     }
 
 
@@ -881,6 +921,7 @@ def _choice_row(
     interface_mac: str,
     wlan: Mapping[str, Any] | None,
     bssid: str,
+    status: str,
 ) -> dict[str, str]:
     row = _base_row(ap)
     row["Radio"] = reported_name
@@ -888,13 +929,45 @@ def _choice_row(
     row["WLAN Index"] = str(choice.bss)
     row["Inferred Subinterface"] = f"{reported_name}.{choice.bss}"
     row["BSSID"] = bssid
+    row["Status"] = status
     if wlan is not None:
-        status = wlan.get("ssid_status")
+        ssid_status = wlan.get("ssid_status")
         policy = wlan.get("network_policy_name")
         row["SSID"] = _ssid_name(wlan)
-        row["SSID Status"] = "" if status is None else str(status)
+        row["SSID Status"] = "" if ssid_status is None else str(ssid_status)
         row["Network Policy"] = "" if policy is None else str(policy)
     return row
+
+
+def _block_offset(api_mac: str) -> int | None:
+    value = mac_as_int(api_mac)
+    if value is None:
+        return None
+    return value & 0xF
+
+
+def radio_bssids_outside_pattern(radio: Mapping[str, Any]) -> bool:
+    """True when every reported WLAN BSSID sits outside base+4 through base+15."""
+    api_mac = normalize_mac(radio.get("mac_address") or radio.get("mac"))
+    interface_mac, api_index = interface_mac_for_radio(api_mac)
+    base = mac_as_int(interface_mac)
+    if api_index is None or base is None:
+        return False
+    expected = {format_mac(base + offset) for offset in range(4, 16)}
+    reported = [
+        bssid
+        for bssid in (
+            normalize_mac(wlan.get("bssid")) for wlan in _wlan_list(radio)
+        )
+        if bssid
+    ]
+    if not reported:
+        return False
+    return not any(bssid in expected for bssid in reported)
+
+
+def ap_has_bssid_pattern_mismatch(radios: Sequence[Mapping[str, Any]]) -> bool:
+    return any(radio_bssids_outside_pattern(radio) for radio in radios)
 
 
 def rows_for_ap(
@@ -924,6 +997,7 @@ def rows_for_ap(
                 row["Radio"] = choice.radio
                 row["WLAN Index"] = str(choice.bss)
                 row["Inferred Subinterface"] = choice.label
+                row["Status"] = "no-radio"
                 rows.append(row)
             continue
         any_radio = True
@@ -932,13 +1006,59 @@ def rows_for_ap(
             api_mac = normalize_mac(radio.get("mac_address") or radio.get("mac"))
             interface_mac, api_index = interface_mac_for_radio(api_mac)
             wlan_by_bssid = _wlan_by_bssid(radio)
+            offset = _block_offset(api_mac)
             for choice in radio_choices:
-                if api_index is None:
-                    bssid = interface_mac if choice.bss == 0 else ""
-                else:
-                    bssid = bssid_for_index(interface_mac, choice.bss)
-                wlan = wlan_by_bssid.get(bssid)
-                if ssid_filter and (wlan is None or _ssid_name(wlan) not in ssid_filter):
+                if offset is not None and 1 <= offset <= 3:
+                    if ssid_filter:
+                        continue
+                    rows.append(
+                        _choice_row(
+                            ap,
+                            reported_name=reported_name,
+                            choice=choice,
+                            interface_mac="",
+                            wlan=None,
+                            bssid="",
+                            status="unexpected-mac",
+                        )
+                    )
+                    continue
+                if choice.bss == 0:
+                    if ssid_filter:
+                        continue
+                    base_mac = interface_mac if api_index is not None else ""
+                    rows.append(
+                        _choice_row(
+                            ap,
+                            reported_name=reported_name,
+                            choice=choice,
+                            interface_mac=base_mac,
+                            wlan=None,
+                            bssid=base_mac,
+                            status="base",
+                        )
+                    )
+                    continue
+                calculated = (
+                    bssid_for_index(interface_mac, choice.bss) if api_index is not None else ""
+                )
+                wlan = wlan_by_bssid.get(calculated) if calculated else None
+                if wlan is not None:
+                    if ssid_filter and _ssid_name(wlan) not in ssid_filter:
+                        continue
+                    rows.append(
+                        _choice_row(
+                            ap,
+                            reported_name=reported_name,
+                            choice=choice,
+                            interface_mac=interface_mac,
+                            wlan=wlan,
+                            bssid=calculated,
+                            status="confirmed",
+                        )
+                    )
+                    continue
+                if ssid_filter:
                     continue
                 rows.append(
                     _choice_row(
@@ -946,8 +1066,9 @@ def rows_for_ap(
                         reported_name=reported_name,
                         choice=choice,
                         interface_mac=interface_mac,
-                        wlan=wlan,
-                        bssid=bssid,
+                        wlan=None,
+                        bssid="",
+                        status="not-reported",
                     )
                 )
     return rows, any_radio
@@ -958,13 +1079,17 @@ def build_rows(
     radio_map: Mapping[Any, Sequence[Mapping[str, Any]]],
     choices: Sequence[InterfaceChoice],
     ssid_filter: set[str],
-) -> tuple[list[dict[str, str]], int]:
+) -> tuple[list[dict[str, str]], int, list[tuple[str, str]]]:
     rows: list[dict[str, str]] = []
     with_radio = 0
+    mismatches: list[tuple[str, str]] = []
     for ap in access_points:
+        radios = radio_map.get(ap["id"], ())
+        if ap_has_bssid_pattern_mismatch(radios):
+            mismatches.append((str(ap["hostname"]), str(ap["product_type"])))
         ap_rows, has_radio = rows_for_ap(
             ap,
-            radio_map.get(ap["id"], ()),
+            radios,
             choices,
             ssid_filter,
         )
@@ -972,7 +1097,8 @@ def build_rows(
             with_radio += 1
         rows.extend(ap_rows)
     rows.sort(key=row_sort_key)
-    return rows, with_radio
+    mismatches.sort(key=lambda item: (item[0].casefold(), item[1].casefold()))
+    return rows, with_radio, mismatches
 
 
 def default_out_path(now: datetime | None = None) -> str:
@@ -999,6 +1125,8 @@ def print_summary(
     rows_written: int,
     choices: Sequence[InterfaceChoice],
     unknown_types: set[str],
+    mismatches: Sequence[tuple[str, str]],
+    verbose: bool,
 ) -> None:
     unassigned = sum(1 for ap in access_points if ap["site"] == UNASSIGNED_SITE)
     unknown = ", ".join(sorted(unknown_types, key=str.casefold)) or "none"
@@ -1009,6 +1137,10 @@ def print_summary(
     eprint(f"Rows written: {rows_written}")
     eprint(f"APs with no location: {unassigned}")
     eprint(f"Unrecognized location types: {unknown}")
+    eprint(f"APs with WLAN BSSIDs outside the expected pattern: {len(mismatches)}")
+    if verbose:
+        for hostname, model in mismatches:
+            eprint(f"  {hostname} ({model})")
     eprint(interface_warning(choices))
 
 
@@ -1069,14 +1201,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Log request URLs without the token, and page counts",
+        help=(
+            "Log request URLs without the token, page counts, and the "
+            "hostname and model of each AP whose WLAN BSSIDs fall outside "
+            "the expected block."
+        ),
     )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    settings = load_config(args.config)
+    settings = load_config(resolve_default_config(args.config))
     choices = (
         parse_interface_list(args.interface)
         if args.interface is not None
@@ -1104,7 +1240,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         connected_only=connected_only,
     )
     radio_map = fetch_radio_map(client, [ap["id"] for ap in access_points])
-    rows, with_radio = build_rows(access_points, radio_map, choices, ssid_filter)
+    rows, with_radio, mismatches = build_rows(
+        access_points, radio_map, choices, ssid_filter
+    )
     write_csv(out_path, rows)
     print_summary(
         out_path=out_path,
@@ -1113,6 +1251,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         rows_written=len(rows),
         choices=choices,
         unknown_types=unknown_types,
+        mismatches=mismatches,
+        verbose=args.verbose,
     )
 
 

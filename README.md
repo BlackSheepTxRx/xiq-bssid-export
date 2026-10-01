@@ -1,6 +1,6 @@
 # ExtremeCloud IQ BSSID export
 
-Command-line tool that lists every access point in an ExtremeCloud IQ organization and writes a CSV row for each interface you choose. Rows are sorted by site, building, floor, and AP name.
+Command-line tool that lists every access point in an ExtremeCloud IQ organization and writes a CSV row for each interface you choose. Rows are sorted by site, building, floor, and AP name. Access points whose site is `(unassigned)` sort after every named site.
 
 The shipped `config.json` asks for **wifi1.0**. That is the radio's base BSSID: the address whose last hex digit is `0`. `wifi1.1` is 4 higher and carries the first SSID. Each later BSS is one higher than that.
 
@@ -18,7 +18,14 @@ python3 -m pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Put the token in `.env` as `XIQ_API_TOKEN`. The script reads that file itself and never prints the token. `.env` is gitignored.
+Put the token in `.env` as `XIQ_API_TOKEN`. The script reads `.env` from the working directory, then from the directory that contains `xiq_bssid_export.py`. A variable that is already set in the environment wins. The token is never printed. `.env` is gitignored. The same two locations are checked for the default `config.json`.
+
+Tests use a separate file and do not call the API:
+
+```bash
+python3 -m pip install -r requirements-dev.txt
+python3 -m pytest
+```
 
 ## Choose the radio and BSS
 
@@ -75,7 +82,7 @@ python3 xiq_bssid_export.py --ssid "Corp"
 | `--connected-only` / `--no-connected-only` | Overrides `connected_only`. |
 | `--out PATH` | Overrides `out`. |
 | `--base-url URL` | Overrides `base_url`. |
-| `--verbose` | Log each request URL and the page counts. The token is not included. |
+| `--verbose` | Log each request URL and the page counts, and list each AP whose WLAN BSSIDs fall outside the expected block. The token is not included. |
 
 ## How the BSSID is chosen
 
@@ -85,22 +92,32 @@ For each access point whose `device_function` is `AP`:
 2. `GET /devices/radio-information` supplies the radios. Device IDs are sent in batches of 50. This endpoint rejects a page size above 50, so the script asks for 50 records per page.
 3. Each requested interface is matched to the radio of the same name (`wifi1.0` and `wifi1.1` both use the `wifi1` radio).
 4. IQ Engine gives that radio a 16-address block aligned to a trailing `0`. That address is `wifiN.0`. `wifiN.1` is 4 higher. `wifiN.2` is 5 higher. The API `mac_address` is `wifiN.0` when no SSID is up, and `wifiN.1` when one is. The script moves an address ending in `4` back to `0` before it applies the BSS index.
-5. `Radio MAC` is always `wifiN.0`. `BSSID` is the requested BSS. When a WLAN in the API uses that BSSID, its SSID, status, and network policy are written on the row.
+5. `Radio MAC` is `wifiN.0` when the block base is known. For `wifiN.0`, `BSSID` is that base and the SSID stays blank. For `wifiN.1` and later, `BSSID` is filled only when a WLAN from the API uses that calculated address. Otherwise `BSSID` stays blank and the row is still written.
 6. If the access point has no matching radio, one row is written per requested interface with the address columns left blank.
 
-`wifi1.0` on AP-EXAMPLE-01 is `aa:bb:cc:00:00:60`. The API returns `aa:bb:cc:00:00:64`, and `show interface` labels that address `Wifi1.1`.
+Example for a base of `aa:bb:cc:00:00:60` on `AP-EXAMPLE-01`: `wifi1.0` is `aa:bb:cc:00:00:60`. The API often returns `aa:bb:cc:00:00:64`, which is `wifi1.1`. `wifi1.2` is `aa:bb:cc:00:00:65`.
 
 ## CSV columns
 
-Site, Building, Floor, AP Name, Serial, Model, Connected, Radio, Radio MAC, WLAN Index, Inferred Subinterface, SSID, BSSID, SSID Status, Network Policy, Location Source.
+Site, Building, Floor, AP Name, Serial, Model, Connected, Radio, Radio MAC, WLAN Index, Inferred Subinterface, SSID, BSSID, SSID Status, Network Policy, Location Source, Status.
 
 `Inferred Subinterface` is the interface from `config.json`, such as `wifi1.0`. `WLAN Index` is the number after the dot. `Location Source` is `tree` when the location tree identified the place, `breadcrumb-guess` when a breadcrumb id was missing from the tree, and `unassigned` when the access point has no location. Unassigned access points use the site name `(unassigned)`.
+
+`Status` is one of:
+
+| Status | Meaning |
+|---|---|
+| `base` | A `wifiN.0` row. `BSSID` is the block base. |
+| `confirmed` | `wifiN.1` or later, and the calculated address matched a WLAN from the API. |
+| `not-reported` | `wifiN.1` or later, and the API returned no WLAN at that address. `BSSID` is blank. |
+| `no-radio` | The access point did not report the requested radio. |
+| `unexpected-mac` | The API radio MAC was not on the block boundary (last hex digit 1, 2, or 3), so no address was calculated. |
 
 MAC addresses are written as lowercase colon-separated values.
 
 ## Run summary
 
-When the file is written, the script prints the output path, access point count, how many access points reported a selected radio, rows written, access points with no location, unrecognized location types, and the interfaces that were exported.
+When the file is written, the script prints the output path, access point count, how many access points reported a selected radio, rows written, access points with no location, unrecognized location types, `APs with WLAN BSSIDs outside the expected pattern: N`, and the interfaces that were exported. `--verbose` adds the hostname and model of each mismatched access point. An access point counts when a radio reports WLAN BSSIDs and none of them fall in that radio's base+4 through base+15 range.
 
 ## Errors and retries
 
@@ -108,14 +125,14 @@ Each request times out after 30 seconds. HTTP 429 and 5xx responses are retried 
 
 ## Verify on an access point
 
-Checked against `show interface` on AP-EXAMPLE-01, serial `XXXXXXXXXXXXXX`:
+On the access point, `show interface` names the base address `Wifi1` and the first SSID `Wifi1.1`. This export calls the base `wifi1.0`. A fictional access point, `AP-EXAMPLE-01` serial `XXXXXXXXXXXXXX`, with base `aa:bb:cc:00:00:60` looks like this:
 
-| Interface | MAC | SSID |
-|---|---|---|
-| wifi1.0 | `aa:bb:cc:00:00:60` | none |
-| wifi1.1 | `aa:bb:cc:00:00:64` | EXAMPLE-SSID-1 |
-| wifi1.2 | `aa:bb:cc:00:00:65` | EXAMPLE-SSID-2 |
+| Interface | MAC | SSID | Status |
+|---|---|---|---|
+| wifi1.0 | `aa:bb:cc:00:00:60` | none | base |
+| wifi1.1 | `aa:bb:cc:00:00:64` | EXAMPLE-SSID-1 | confirmed |
+| wifi1.2 | `aa:bb:cc:00:00:65` | EXAMPLE-SSID-2 | confirmed |
 
 ## What stays out of git
 
-`.gitignore` excludes `.env`, API token responses, generated CSV files, `LOCAL_HANDOFF.md`, and Python bytecode. Do not commit tokens, passwords, or exported inventories.
+`.gitignore` excludes `.env`, API token responses, generated CSV files, `LOCAL_HANDOFF.md`, and Python bytecode. Do not commit tokens, passwords, exported inventories, or real hostnames, serials, MAC addresses, and SSIDs.
