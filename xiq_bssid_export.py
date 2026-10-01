@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Export ExtremeCloud IQ AP BSSIDs for one radio, sorted by site and floor.
+"""Export chosen ExtremeCloud IQ BSSIDs, sorted by site and floor.
 
-The script reads every access point in an ExtremeCloud IQ organization, keeps
-the selected radio (wifi1 by default), and writes one CSV row for wifi1.0.
-That row is the BSSID equal to the radio MAC. Later subinterfaces (wifi1.1,
-wifi1.2, and so on) are omitted. Rows are sorted by site, building, floor,
-and AP name.
+The script reads every access point in an ExtremeCloud IQ organization and
+writes one CSV row per access point for each interface in ``config.json``.
+The shipped default is ``wifi1.0``, the base BSSID whose last hex digit is 0.
+``wifi1.1`` is 4 higher and is the first SSID. Later SSIDs step by one from
+there. Rows are sorted by site, building, floor, and AP name.
 
 Setup
 -----
@@ -13,67 +13,28 @@ Python 3.10 or newer, plus the ``requests`` package::
 
     python3 -m pip install -r requirements.txt
 
-Authentication
---------------
-Set a bearer token in the environment. The script sends it as
-``Authorization: Bearer <token>`` and never prints or logs the token::
-
-    export XIQ_API_TOKEN="paste-token-here"
-    python3 xiq_wifi1_bssid_export.py
-
-If ``XIQ_API_TOKEN`` is missing, the script exits with a message that names
-the variable. Optional fallback: when the token is unset and both
-``XIQ_USERNAME`` and ``XIQ_PASSWORD`` are set, the script calls ``POST /login``
-and uses ``access_token`` from the response. A token that is already set is
-used as-is; the username and password are not sent.
-
-Flags
------
-``--radio NAME``
-    Radio name to match, case-insensitively. Default: ``wifi1``.
-``--ssid NAME``
-    Repeatable. Keep the wifi1.0 row only when its SSID is one of these
-    names (case-sensitive).
-``--site NAME``
-    Repeatable. Keep only these sites. Matching is case-insensitive.
-``--connected-only``
-    Skip disconnected APs. Their radio data may be stale or empty.
-``--out PATH``
-    CSV path. Default: ``xiq_wifi1_bssids_YYYYMMDD_HHMM.csv`` in the
-    current directory.
-``--base-url URL``
-    API base URL. Default: ``https://api.extremecloudiq.com``.
-``--verbose``
-    Log each request URL (the token is not included) and the page counts.
-
-The CSV columns are Site, Building, Floor, AP Name, Serial, Model, Connected,
-Radio, Radio MAC, WLAN Index, Inferred Subinterface, SSID, BSSID, SSID Status,
-Network Policy, Location Source, and Notes.
-
-``Inferred Subinterface`` is ``wifi1.0`` on a normal run. The API does not
-return subinterface names. wifi1.0 is inferred as the BSSID that equals the
-wifi1 radio MAC. Each later SSID on that radio uses the next MAC address
-(wifi1.1, wifi1.2, and so on) and is left out of the CSV. The script prints
-a one-line warning about that at the end of every run.
+Put the bearer token in ``.env`` as ``XIQ_API_TOKEN``. The script reads that
+file itself and never prints the token. ``config.json`` chooses the
+interfaces. See ``AI.md`` for an assistant setting this up on a new machine.
 
 Verification
 ------------
-Before trusting the Inferred Subinterface column, pick one AP, SSH to it, and
-run ``show interface``. The wifi1.0 MAC should match the BSSID in the CSV
-for that AP. wifi1.1, wifi1.2, and the later subinterfaces are not included.
+Confirmed against ``show interface`` on AP-EXAMPLE-01 (XXXXXXXXXXXXXX):
+``wifi1.0`` is ``aa:bb:cc:00:00:60`` and ``wifi1.1`` is ``aa:bb:cc:00:00:64``.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import re
 import sys
 import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, NamedTuple, Sequence
 from urllib.parse import urlparse
 
 import requests
@@ -85,8 +46,13 @@ RADIO_BATCH_SIZE = 50
 REQUEST_TIMEOUT_SECONDS = 30
 BACKOFF_SECONDS = (1, 2, 4, 8, 16)
 DEFAULT_BASE_URL = "https://api.extremecloudiq.com"
-DEFAULT_RADIO = "wifi1"
+DEFAULT_CONFIG_PATH = "config.json"
+DEFAULT_INTERFACE = "wifi1.0"
+# wifiN.1 sits at base+4. wifiN.12 is the last address in the 16-wide block.
+MAX_BSS_INDEX = 12
 UNASSIGNED_SITE = "(unassigned)"
+_CONFIG_KEYS = {"interfaces", "ssids", "sites", "connected_only", "base_url", "out"}
+_DOTENV_KEYS = {"XIQ_API_TOKEN", "XIQ_USERNAME", "XIQ_PASSWORD"}
 # A fully unresolved breadcrumb is treated as ending on a floor, then a
 # building, then a site. XIQ lists ancestors from the root down to the AP,
 # and this export sorts floor placements. location_source records the guess.
@@ -115,6 +81,13 @@ COLUMNS = (
 _HEX_MAC = re.compile(r"[^0-9a-f]")
 _NATURAL_SPLIT = re.compile(r"(\d+)")
 _RETRY_AFTER_NUMBER = re.compile(r"^\d+(?:\.\d+)?$")
+_INTERFACE = re.compile(r"^(wifi\d+)\.(\d+)$", re.IGNORECASE)
+
+
+class InterfaceChoice(NamedTuple):
+    radio: str
+    bss: int
+    label: str
 
 
 def eprint(message: str) -> None:
@@ -233,11 +206,6 @@ def row_sort_key(row: Mapping[str, str]) -> tuple[Any, ...]:
     )
 
 
-# wifi1.0 uses the radio MAC. wifi1.1, wifi1.2, ... are the following addresses.
-# Extreme APs expose at most a handful of SSIDs per radio.
-MAX_SUBINTERFACE_OFFSET = 15
-
-
 def mac_as_int(mac: str) -> int | None:
     text = normalize_mac(mac)
     if len(text) != 17:
@@ -248,23 +216,172 @@ def mac_as_int(mac: str) -> int | None:
         return None
 
 
-def subinterface_index(radio_mac: str, bssid: str) -> int | None:
-    """Return 0 when the BSSID is the radio MAC, 1 for the next address, and so on."""
-    radio = mac_as_int(radio_mac)
-    bss = mac_as_int(bssid)
-    if radio is None or bss is None:
-        return None
-    delta = bss - radio
-    if 0 <= delta <= MAX_SUBINTERFACE_OFFSET:
-        return delta
-    return None
+def format_mac(value: int) -> str:
+    text = f"{value:012x}"
+    return ":".join(text[i : i + 2] for i in range(0, 12, 2))
 
 
-def subinterface_warning(radio: str) -> str:
+def interface_mac_for_radio(api_mac: str) -> tuple[str, int | None]:
+    """Map an API radio MAC to the ``show interface`` WifiN address.
+
+    IQ Engine gives each radio a 16-address block whose base ends in 0.
+    That base is WifiN and carries no SSID. WifiN.1 is base + 4, WifiN.2
+    is base + 5, and so on. ``mac_address`` from radio-information is the
+    base when no SSID is up, and WifiN.1 when one is.
+
+    The returned index is 0 when ``api_mac`` is already WifiN, 1 for
+    WifiN.1, and so on. None means the address is outside that pattern
+    and was left unchanged.
+    """
+    normalized = normalize_mac(api_mac)
+    value = mac_as_int(normalized)
+    if value is None:
+        return normalized, None
+    offset = value & 0xF
+    if offset == 0:
+        return normalized, 0
+    if offset >= 4:
+        return format_mac(value & ~0xF), offset - 3
+    return normalized, None
+
+
+def bssid_for_index(interface_mac: str, bss: int) -> str:
+    """Return wifiN.0 at the block base, wifiN.1 at base + 4, then one each."""
+    value = mac_as_int(interface_mac)
+    if value is None:
+        return ""
+    if bss == 0:
+        return format_mac(value)
+    return format_mac(value + 3 + bss)
+
+
+def parse_interface(text: str) -> InterfaceChoice:
+    match = _INTERFACE.fullmatch(text.strip())
+    if match is None:
+        raise SystemExit(
+            f"interface must look like {DEFAULT_INTERFACE}, got {text!r}"
+        )
+    radio = match.group(1).lower()
+    bss = int(match.group(2))
+    if bss > MAX_BSS_INDEX:
+        raise SystemExit(
+            f"{text} is outside the radio block "
+            f"(wifiN.0 through wifiN.{MAX_BSS_INDEX})"
+        )
+    return InterfaceChoice(radio, bss, f"{radio}.{bss}")
+
+
+def parse_interface_list(values: Sequence[str]) -> list[InterfaceChoice]:
+    choices: list[InterfaceChoice] = []
+    seen: set[str] = set()
+    for value in values:
+        choice = parse_interface(value)
+        if choice.label in seen:
+            continue
+        seen.add(choice.label)
+        choices.append(choice)
+    if not choices:
+        raise SystemExit(
+            f"list at least one interface, such as {DEFAULT_INTERFACE}"
+        )
+    return choices
+
+
+def _string_list(value: Any, field: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise SystemExit(f"config {field} must be a list of strings")
+    return [item for item in value if item.strip()]
+
+
+def default_settings() -> dict[str, Any]:
+    return {
+        "interfaces": parse_interface_list([DEFAULT_INTERFACE]),
+        "ssids": [],
+        "sites": [],
+        "connected_only": False,
+        "base_url": DEFAULT_BASE_URL,
+        "out": "",
+    }
+
+
+def load_config(path: str) -> dict[str, Any]:
+    """Read config.json. A missing default file falls back to wifi1.0."""
+    settings = default_settings()
+    if not os.path.isfile(path):
+        if os.path.normcase(os.path.normpath(path)) == os.path.normcase(
+            os.path.normpath(DEFAULT_CONFIG_PATH)
+        ):
+            eprint(f"{path} not found; using {DEFAULT_INTERFACE}")
+            return settings
+        raise SystemExit(f"config file not found: {path}")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except OSError as exc:
+        raise SystemExit(f"could not read {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"could not parse {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise SystemExit(f"{path} must contain a JSON object")
+    unknown = sorted(set(payload) - _CONFIG_KEYS)
+    if unknown:
+        raise SystemExit(
+            f"{path} has unknown keys: {', '.join(unknown)}. "
+            f"Expected: {', '.join(sorted(_CONFIG_KEYS))}"
+        )
+    if "interfaces" in payload:
+        interfaces = payload["interfaces"]
+        if (
+            not isinstance(interfaces, list)
+            or not all(isinstance(item, str) for item in interfaces)
+        ):
+            raise SystemExit("config interfaces must be a list of strings")
+        settings["interfaces"] = parse_interface_list(interfaces)
+    settings["ssids"] = _string_list(payload.get("ssids", []), "ssids")
+    settings["sites"] = _string_list(payload.get("sites", []), "sites")
+    if "connected_only" in payload and not isinstance(payload["connected_only"], bool):
+        raise SystemExit("config connected_only must be true or false")
+    settings["connected_only"] = bool(payload.get("connected_only", False))
+    if "base_url" in payload:
+        if not isinstance(payload["base_url"], str) or not payload["base_url"].strip():
+            raise SystemExit("config base_url must be a URL string")
+        settings["base_url"] = payload["base_url"].strip()
+    if "out" in payload and payload["out"] is not None:
+        if not isinstance(payload["out"], str):
+            raise SystemExit("config out must be a file path string")
+        settings["out"] = payload["out"].strip()
+    return settings
+
+
+def load_dotenv(path: str = ".env") -> None:
+    """Fill unset XIQ_* variables from .env. Values are never printed."""
+    if not os.path.isfile(path):
+        return
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except OSError as exc:
+        raise SystemExit(f"could not read {path}: {exc}") from exc
+    for line in lines:
+        text = line.strip()
+        if not text or text.startswith("#") or "=" not in text:
+            continue
+        key, value = text.split("=", 1)
+        key = key.strip()
+        if key not in _DOTENV_KEYS:
+            continue
+        if os.environ.get(key, "").strip():
+            continue
+        os.environ[key] = value.strip().strip('"').strip("'")
+
+
+def interface_warning(choices: Sequence[InterfaceChoice]) -> str:
+    labels = ", ".join(choice.label for choice in choices)
     return (
-        f"Warning: only {radio}.0 is written. Its BSSID is the {radio} radio MAC; "
-        f"{radio}.1 and later are omitted. The API does not return subinterface names. "
-        'Confirm on an AP with "show interface" before trusting that label.'
+        f"Exporting {labels}. "
+        "wifiN.0 is the base BSSID (last hex digit 0). "
+        "wifiN.1 is 4 higher. Each later BSS is one higher than wifiN.1."
     )
 
 
@@ -278,7 +395,7 @@ class XiqClient:
         self.session = requests.Session()
         self.session.headers["Authorization"] = f"Bearer {token}"
         self.session.headers["Accept"] = "application/json"
-        self.session.headers["User-Agent"] = "xiq-wifi1-bssid-export"
+        self.session.headers["User-Agent"] = "xiq-bssid-export"
 
     def get(self, path: str, params: Sequence[tuple[str, str]] | None = None) -> Any:
         return self._request("GET", path, params=params)
@@ -394,6 +511,7 @@ def validate_base_url(base_url: str) -> str:
 
 def obtain_token(base_url: str, *, verbose: bool) -> str:
     """Read XIQ_API_TOKEN, or log in when only username and password are set."""
+    load_dotenv()
     token = os.environ.get("XIQ_API_TOKEN", "").strip()
     if token:
         if verbose:
@@ -741,98 +859,125 @@ def _wlan_list(radio: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     return [wlan for wlan in wlans if isinstance(wlan, dict)]
 
 
-def _wlan_row(
+def _ssid_name(wlan: Mapping[str, Any]) -> str:
+    ssid = wlan.get("ssid")
+    return "" if ssid is None else str(ssid)
+
+
+def _wlan_by_bssid(
+    radio: Mapping[str, Any],
+) -> dict[str, Mapping[str, Any]]:
+    found: dict[str, Mapping[str, Any]] = {}
+    for wlan in _wlan_list(radio):
+        bssid = normalize_mac(wlan.get("bssid"))
+        if bssid:
+            found[bssid] = wlan
+    return found
+
+
+def _choice_row(
     ap: Mapping[str, Any],
     *,
-    radio_name: str,
     reported_name: str,
-    radio_mac: str,
-    wlan: Mapping[str, Any],
+    choice: InterfaceChoice,
+    interface_mac: str,
+    api_mac: str,
+    api_index: int | None,
+    wlan: Mapping[str, Any] | None,
     bssid: str,
 ) -> dict[str, str]:
-    ssid = "" if wlan.get("ssid") is None else str(wlan.get("ssid"))
-    status = wlan.get("ssid_status")
-    policy = wlan.get("network_policy_name")
     row = _base_row(ap)
     row["Radio"] = reported_name
-    row["Radio MAC"] = radio_mac
-    row["WLAN Index"] = "0"
-    row["Inferred Subinterface"] = f"{radio_name}.0"
-    row["SSID"] = ssid
+    row["Radio MAC"] = interface_mac
+    row["WLAN Index"] = str(choice.bss)
+    row["Inferred Subinterface"] = f"{reported_name}.{choice.bss}"
     row["BSSID"] = bssid
-    row["SSID Status"] = "" if status is None else str(status)
-    row["Network Policy"] = "" if policy is None else str(policy)
+    if wlan is not None:
+        status = wlan.get("ssid_status")
+        policy = wlan.get("network_policy_name")
+        row["SSID"] = _ssid_name(wlan)
+        row["SSID Status"] = "" if status is None else str(status)
+        row["Network Policy"] = "" if policy is None else str(policy)
+    notes: list[str] = []
+    if not interface_mac:
+        notes.append(f"no {choice.radio} MAC reported")
+    elif api_index is None and api_mac:
+        notes.append(
+            f"API radio MAC {api_mac} is outside the {reported_name} address block"
+        )
+        if choice.bss > 0:
+            notes.append(f"could not place {reported_name}.{choice.bss}")
+    elif choice.bss == 0 and api_index not in (None, 0):
+        notes.append(f"API radio MAC {api_mac} is {reported_name}.{api_index}")
+    elif choice.bss > 0 and wlan is None and bssid:
+        notes.append(f"no SSID reported on {reported_name}.{choice.bss}")
+    row["Notes"] = "; ".join(notes)
     return row
 
 
 def rows_for_ap(
     ap: Mapping[str, Any],
     radios: Sequence[Mapping[str, Any]],
-    radio_name: str,
+    choices: Sequence[InterfaceChoice],
     ssid_filter: set[str],
 ) -> tuple[list[dict[str, str]], bool]:
-    """Return the wifi1.0 row, and whether the AP reported the selected radio.
-
-    wifi1.0 is the BSSID equal to the radio MAC. wifi1.1 and later are dropped.
-    """
-    wanted = radio_name.casefold()
-    matched = [
-        radio
-        for radio in radios
-        if str(radio.get("name") or "").strip().casefold() == wanted
-    ]
-    if not matched:
-        if ssid_filter:
-            return [], False
-        row = _base_row(ap)
-        row["Notes"] = f"no {radio_name} radio reported"
-        return [row], False
+    """Return one row per requested interface, and whether any radio existed."""
+    grouped: dict[str, list[InterfaceChoice]] = {}
+    for choice in choices:
+        grouped.setdefault(choice.radio.casefold(), []).append(choice)
 
     rows: list[dict[str, str]] = []
-    for radio in matched:
-        reported_name = str(radio.get("name") or radio_name).strip() or radio_name
-        mac = normalize_mac(radio.get("mac_address") or radio.get("mac"))
-        wlans = _wlan_list(radio)
-        matched_base = False
-        for wlan in wlans:
-            ssid = "" if wlan.get("ssid") is None else str(wlan.get("ssid"))
-            if ssid_filter and ssid not in ssid_filter:
+    any_radio = False
+    for radio_key, radio_choices in grouped.items():
+        matched = [
+            radio
+            for radio in radios
+            if str(radio.get("name") or "").strip().casefold() == radio_key
+        ]
+        if not matched:
+            if ssid_filter:
                 continue
-            bssid = normalize_mac(wlan.get("bssid"))
-            if subinterface_index(mac, bssid) != 0:
-                continue
-            rows.append(
-                _wlan_row(
-                    ap,
-                    radio_name=radio_name,
-                    reported_name=reported_name,
-                    radio_mac=mac,
-                    wlan=wlan,
-                    bssid=bssid,
-                )
-            )
-            matched_base = True
-        if matched_base or ssid_filter:
+            for choice in radio_choices:
+                row = _base_row(ap)
+                row["Radio"] = choice.radio
+                row["WLAN Index"] = str(choice.bss)
+                row["Inferred Subinterface"] = choice.label
+                row["Notes"] = f"no {choice.radio} radio reported"
+                rows.append(row)
             continue
-        row = _base_row(ap)
-        row["Radio"] = reported_name
-        row["Radio MAC"] = mac
-        row["WLAN Index"] = "0"
-        row["Inferred Subinterface"] = f"{radio_name}.0"
-        row["BSSID"] = mac
-        if wlans:
-            row["Notes"] = (
-                f"no SSID BSSID matched the {radio_name} radio MAC; "
-                f"BSSID is the {radio_name}.0 radio address"
-            )
-        rows.append(row)
-    return rows, True
+        any_radio = True
+        for radio in matched:
+            reported_name = str(radio.get("name") or radio_key).strip() or radio_key
+            api_mac = normalize_mac(radio.get("mac_address") or radio.get("mac"))
+            interface_mac, api_index = interface_mac_for_radio(api_mac)
+            wlan_by_bssid = _wlan_by_bssid(radio)
+            for choice in radio_choices:
+                if api_index is None:
+                    bssid = interface_mac if choice.bss == 0 else ""
+                else:
+                    bssid = bssid_for_index(interface_mac, choice.bss)
+                wlan = wlan_by_bssid.get(bssid)
+                if ssid_filter and (wlan is None or _ssid_name(wlan) not in ssid_filter):
+                    continue
+                rows.append(
+                    _choice_row(
+                        ap,
+                        reported_name=reported_name,
+                        choice=choice,
+                        interface_mac=interface_mac,
+                        api_mac=api_mac,
+                        api_index=api_index,
+                        wlan=wlan,
+                        bssid=bssid,
+                    )
+                )
+    return rows, any_radio
 
 
 def build_rows(
     access_points: Sequence[Mapping[str, Any]],
     radio_map: Mapping[Any, Sequence[Mapping[str, Any]]],
-    radio_name: str,
+    choices: Sequence[InterfaceChoice],
     ssid_filter: set[str],
 ) -> tuple[list[dict[str, str]], int]:
     rows: list[dict[str, str]] = []
@@ -841,7 +986,7 @@ def build_rows(
         ap_rows, has_radio = rows_for_ap(
             ap,
             radio_map.get(ap["id"], ()),
-            radio_name,
+            choices,
             ssid_filter,
         )
         if has_radio:
@@ -853,7 +998,7 @@ def build_rows(
 
 def default_out_path(now: datetime | None = None) -> str:
     stamp = (now or datetime.now()).strftime("%Y%m%d_%H%M")
-    return f"xiq_wifi1_bssids_{stamp}.csv"
+    return f"xiq_bssids_{stamp}.csv"
 
 
 def write_csv(path: str, rows: Sequence[Mapping[str, str]]) -> None:
@@ -873,57 +1018,74 @@ def print_summary(
     access_points: Sequence[Mapping[str, Any]],
     with_radio: int,
     rows_written: int,
-    radio_name: str,
+    choices: Sequence[InterfaceChoice],
     unknown_types: set[str],
 ) -> None:
     unassigned = sum(1 for ap in access_points if ap["site"] == UNASSIGNED_SITE)
     unknown = ", ".join(sorted(unknown_types, key=str.casefold)) or "none"
+    radios = ", ".join(dict.fromkeys(choice.radio for choice in choices))
     eprint(f"Output: {out_path}")
     eprint(f"APs: {len(access_points)}")
-    eprint(f"APs with {radio_name}: {with_radio}")
+    eprint(f"APs with {radios}: {with_radio}")
     eprint(f"Rows written: {rows_written}")
     eprint(f"APs with no location: {unassigned}")
     eprint(f"Unrecognized location types: {unknown}")
-    eprint(subinterface_warning(radio_name))
+    eprint(interface_warning(choices))
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Export ExtremeCloud IQ AP BSSIDs for one radio to a CSV "
+            "Export chosen ExtremeCloud IQ BSSIDs to a CSV "
             "sorted by site, building, and floor."
         )
     )
     parser.add_argument(
-        "--radio",
-        default=DEFAULT_RADIO,
-        help=f"Radio name to match (default: {DEFAULT_RADIO})",
+        "--config",
+        default=DEFAULT_CONFIG_PATH,
+        help=f"JSON settings file (default: {DEFAULT_CONFIG_PATH})",
+    )
+    parser.add_argument(
+        "--interface",
+        action="append",
+        default=None,
+        help=(
+            "Interface to export, such as wifi1.0 or wifi1.1. "
+            "Repeat to export more than one. Replaces the config.json list."
+        ),
     )
     parser.add_argument(
         "--ssid",
         action="append",
-        default=[],
-        help="SSID to keep. Repeat for more than one. Case-sensitive.",
+        default=None,
+        help=(
+            "SSID to keep. Repeat for more than one. Case-sensitive. "
+            "Replaces the config.json list. wifiN.0 has no SSID, so a filter drops it."
+        ),
     )
     parser.add_argument(
         "--site",
         action="append",
-        default=[],
-        help="Site to keep. Repeat for more than one. Case-insensitive.",
+        default=None,
+        help=(
+            "Site to keep. Repeat for more than one. Case-insensitive. "
+            "Replaces the config.json list."
+        ),
     )
     parser.add_argument(
         "--connected-only",
-        action="store_true",
-        help="Skip disconnected APs",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Skip disconnected APs. Overrides config.json.",
     )
     parser.add_argument(
         "--out",
-        help="CSV path (default: xiq_wifi1_bssids_YYYYMMDD_HHMM.csv)",
+        help="CSV path. Overrides config.json. Default: xiq_bssids_YYYYMMDD_HHMM.csv",
     )
     parser.add_argument(
         "--base-url",
-        default=DEFAULT_BASE_URL,
-        help=f"API base URL (default: {DEFAULT_BASE_URL})",
+        default=None,
+        help=f"API base URL. Overrides config.json (default: {DEFAULT_BASE_URL}).",
     )
     parser.add_argument(
         "--verbose",
@@ -935,13 +1097,23 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    radio_name = args.radio.strip()
-    if not radio_name:
-        raise SystemExit("--radio must not be empty")
-    base_url = validate_base_url(args.base_url.strip())
-    ssid_filter = {ssid for ssid in args.ssid if ssid != ""}
-    site_filter = {site.strip().casefold() for site in args.site if site.strip()}
-    out_path = args.out or default_out_path()
+    settings = load_config(args.config)
+    choices = (
+        parse_interface_list(args.interface)
+        if args.interface is not None
+        else settings["interfaces"]
+    )
+    base_url = validate_base_url((args.base_url or settings["base_url"]).strip())
+    ssid_values = settings["ssids"] if args.ssid is None else args.ssid
+    site_values = settings["sites"] if args.site is None else args.site
+    ssid_filter = {ssid for ssid in ssid_values if ssid != ""}
+    site_filter = {site.strip().casefold() for site in site_values if site.strip()}
+    connected_only = (
+        settings["connected_only"]
+        if args.connected_only is None
+        else args.connected_only
+    )
+    out_path = args.out or settings["out"] or default_out_path()
 
     token = obtain_token(base_url, verbose=args.verbose)
     client = XiqClient(base_url, token, verbose=args.verbose)
@@ -950,17 +1122,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         client,
         location_by_id,
         site_filter=site_filter,
-        connected_only=args.connected_only,
+        connected_only=connected_only,
     )
     radio_map = fetch_radio_map(client, [ap["id"] for ap in access_points])
-    rows, with_radio = build_rows(access_points, radio_map, radio_name, ssid_filter)
+    rows, with_radio = build_rows(access_points, radio_map, choices, ssid_filter)
     write_csv(out_path, rows)
     print_summary(
         out_path=out_path,
         access_points=access_points,
         with_radio=with_radio,
         rows_written=len(rows),
-        radio_name=radio_name,
+        choices=choices,
         unknown_types=unknown_types,
     )
 

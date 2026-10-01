@@ -1,8 +1,10 @@
-# ExtremeCloud IQ wifi1.0 BSSID export
+# ExtremeCloud IQ BSSID export
 
-Private command-line tool that lists every access point in an ExtremeCloud IQ organization and writes one CSV row for the **wifi1.0** BSSID. Rows are sorted by site, building, floor, and AP name.
+Command-line tool that lists every access point in an ExtremeCloud IQ organization and writes a CSV row for each interface you choose. Rows are sorted by site, building, floor, and AP name.
 
-The API does not return subinterface names. On these access points, wifi1.0 is the BSSID that equals the wifi1 radio MAC. wifi1.1, wifi1.2, and later SSIDs use the following MAC addresses and are left out of the file.
+The shipped `config.json` asks for **wifi1.0**. That is the radio's base BSSID: the address whose last hex digit is `0`. `wifi1.1` is 4 higher and carries the first SSID. Each later BSS is one higher than that.
+
+An assistant setting this up on a new machine should follow [AI.md](AI.md).
 
 ## Requirements
 
@@ -16,80 +18,89 @@ python3 -m pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Put the token in `.env` or export it in the shell. `.env` is gitignored.
+Put the token in `.env` as `XIQ_API_TOKEN`. The script reads that file itself and never prints the token. `.env` is gitignored.
+
+## Choose the radio and BSS
+
+Edit `interfaces` in `config.json`. Each entry is a radio name, a dot, and a BSS index.
+
+```json
+{
+  "interfaces": ["wifi1.0"],
+  "ssids": [],
+  "sites": [],
+  "connected_only": false,
+  "base_url": "https://api.extremecloudiq.com",
+  "out": ""
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `interfaces` | Interfaces to export. Default: `["wifi1.0"]`. Add `"wifi1.1"` or `"wifi0.1"` to export those too. `wifiN.0` through `wifiN.12` are valid. |
+| `ssids` | Optional. Keep a row only when its SSID is in this list. Matching is case-sensitive. `wifiN.0` has no SSID, so a filter drops it. |
+| `sites` | Optional. Keep these sites. Matching is case-insensitive. |
+| `connected_only` | `true` skips disconnected access points. Their radio data may be stale or empty. |
+| `base_url` | API host. Default: `https://api.extremecloudiq.com`. |
+| `out` | CSV path. Leave `""` to write `xiq_bssids_YYYYMMDD_HHMM.csv` in the current directory. |
+
+On the access point, `show interface` names the base address `Wifi1` and the first SSID `Wifi1.1`. This export calls that base address `wifi1.0`, because the base BSSID is the address ending in `0`.
 
 ## Authentication
 
-The script reads `XIQ_API_TOKEN` and sends it as `Authorization: Bearer <token>`. It never prints or logs the token. If the variable is missing, the script exits and names the variable.
-
-Optional fallback: when `XIQ_API_TOKEN` is unset and both `XIQ_USERNAME` and `XIQ_PASSWORD` are set, the script calls `POST /login` and uses `access_token` from the response. A token that is already set is used as-is.
-
-```bash
-export XIQ_API_TOKEN="paste-token-here"
-python3 xiq_wifi1_bssid_export.py
-```
-
-To load a local `.env` file without printing it:
-
-```bash
-set -a
-source .env
-set +a
-python3 xiq_wifi1_bssid_export.py
-```
+The script sends `XIQ_API_TOKEN` as `Authorization: Bearer <token>`. If the variable is already set in the environment, that value wins over `.env`. If the token is missing and both `XIQ_USERNAME` and `XIQ_PASSWORD` are set, the script calls `POST /login` and uses `access_token` from the response. A token that is already set is used as-is.
 
 ## Usage
 
+Run it from the project directory:
+
 ```bash
-python3 xiq_wifi1_bssid_export.py
-python3 xiq_wifi1_bssid_export.py --site "Boston" --connected-only --out boston.csv
-python3 xiq_wifi1_bssid_export.py --ssid "Corp" --verbose
+python3 xiq_bssid_export.py
 ```
 
-The default output file is `xiq_wifi1_bssids_YYYYMMDD_HHMM.csv` in the current directory.
+Flags override `config.json` for one run:
 
-### Flags
+```bash
+python3 xiq_bssid_export.py --interface wifi1.1 --interface wifi1.2 --out wifi1-ssids.csv
+python3 xiq_bssid_export.py --site "Boston" --connected-only --verbose
+python3 xiq_bssid_export.py --ssid "Corp"
+```
 
 | Flag | Meaning |
 |---|---|
-| `--radio NAME` | Radio to match, case-insensitively. Default: `wifi1`. |
-| `--ssid NAME` | Repeatable. Keep the wifi1.0 row only when its SSID is one of these names. Matching is case-sensitive. |
-| `--site NAME` | Repeatable. Keep these sites. Matching is case-insensitive. |
-| `--connected-only` | Skip disconnected access points. Their radio data may be stale or empty. |
-| `--out PATH` | CSV path. |
-| `--base-url URL` | API base URL. Default: `https://api.extremecloudiq.com`. |
+| `--config PATH` | Settings file. Default: `config.json`. |
+| `--interface NAME` | Repeatable. Replaces the `interfaces` list. Example: `wifi1.0`. |
+| `--ssid NAME` | Repeatable. Replaces the `ssids` list. Case-sensitive. |
+| `--site NAME` | Repeatable. Replaces the `sites` list. Case-insensitive. |
+| `--connected-only` / `--no-connected-only` | Overrides `connected_only`. |
+| `--out PATH` | Overrides `out`. |
+| `--base-url URL` | Overrides `base_url`. |
 | `--verbose` | Log each request URL and the page counts. The token is not included. |
 
-## How wifi1.0 is chosen
+## How the BSSID is chosen
 
 For each access point whose `device_function` is `AP`:
 
 1. The location tree and the device breadcrumb supply site, building, and floor.
 2. `GET /devices/radio-information` supplies the radios. Device IDs are sent in batches of 50. This endpoint rejects a page size above 50, so the script asks for 50 records per page.
-3. The radio whose name matches `--radio` is kept.
-4. The WLAN whose BSSID equals that radio's MAC is wifi1.0. Its SSID, status, and network policy are written on the row.
-5. If the radio is present but no SSID uses that MAC, the row still uses the radio MAC as the wifi1.0 BSSID and leaves the SSID blank.
-6. If the access point has no matching radio, one row is written with the note `no wifi1 radio reported`.
+3. Each requested interface is matched to the radio of the same name (`wifi1.0` and `wifi1.1` both use the `wifi1` radio).
+4. IQ Engine gives that radio a 16-address block aligned to a trailing `0`. That address is `wifiN.0`. `wifiN.1` is 4 higher. `wifiN.2` is 5 higher. The API `mac_address` is `wifiN.0` when no SSID is up, and `wifiN.1` when one is. The script moves an address ending in `4` back to `0` before it applies the BSS index.
+5. `Radio MAC` is always `wifiN.0`. `BSSID` is the requested BSS. When a WLAN in the API uses that BSSID, its SSID, status, and network policy are written on the row.
+6. If the access point has no matching radio, one row is written per requested interface with the note `no wifi1 radio reported`.
+
+`wifi1.0` on AP-EXAMPLE-01 is `aa:bb:cc:00:00:60`. The API returns `aa:bb:cc:00:00:64`, and `show interface` labels that address `Wifi1.1`.
 
 ## CSV columns
 
 Site, Building, Floor, AP Name, Serial, Model, Connected, Radio, Radio MAC, WLAN Index, Inferred Subinterface, SSID, BSSID, SSID Status, Network Policy, Location Source, Notes.
 
-`WLAN Index` is `0` and `Inferred Subinterface` is `wifi1.0` when the radio was found. `Location Source` is `tree` when the location tree identified the place, `breadcrumb-guess` when a breadcrumb id was missing from the tree, and `unassigned` when the access point has no location. Unassigned access points use the site name `(unassigned)`.
+`Inferred Subinterface` is the interface from `config.json`, such as `wifi1.0`. `WLAN Index` is the number after the dot. `Notes` records an API address that was not already the base, for example `API radio MAC aa:bb:cc:00:00:64 is wifi1.1`. `Location Source` is `tree` when the location tree identified the place, `breadcrumb-guess` when a breadcrumb id was missing from the tree, and `unassigned` when the access point has no location. Unassigned access points use the site name `(unassigned)`.
 
 MAC addresses are written as lowercase colon-separated values.
 
 ## Run summary
 
-When the file is written, the script prints:
-
-- output path
-- access point count
-- access points that reported the selected radio
-- rows written
-- access points with no location
-- unrecognized location types
-- a one-line warning that wifi1.0 is inferred from the radio MAC
+When the file is written, the script prints the output path, access point count, how many access points reported a selected radio, rows written, access points with no location, unrecognized location types, and the interfaces that were exported.
 
 ## Errors and retries
 
@@ -97,8 +108,14 @@ Each request times out after 30 seconds. HTTP 429 and 5xx responses are retried 
 
 ## Verify on an access point
 
-Before trusting the `wifi1.0` label, SSH to one access point and run `show interface`. The wifi1.0 MAC should match the BSSID in the CSV for that AP.
+Checked against `show interface` on AP-EXAMPLE-01, serial `XXXXXXXXXXXXXX`:
+
+| Interface | MAC | SSID |
+|---|---|---|
+| wifi1.0 | `aa:bb:cc:00:00:60` | none |
+| wifi1.1 | `aa:bb:cc:00:00:64` | EXAMPLE-SSID-1 |
+| wifi1.2 | `aa:bb:cc:00:00:65` | EXAMPLE-SSID-2 |
 
 ## What stays out of git
 
-`.gitignore` excludes `.env`, API token responses, generated CSV files, and Python bytecode. Do not commit tokens, passwords, or exported inventories.
+`.gitignore` excludes `.env`, API token responses, generated CSV files, `LOCAL_HANDOFF.md`, and Python bytecode. Do not commit tokens, passwords, or exported inventories.

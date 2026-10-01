@@ -3,3 +3,5 @@ __pycache__/
 *.py[cod]
 response_*.json
 *.csv
+LOCAL_HANDOFF.md
+show interface.txt

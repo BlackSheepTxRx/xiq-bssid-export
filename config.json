@@ -1,0 +1,8 @@
+{
+  "interfaces": ["wifi1.0"],
+  "ssids": [],
+  "sites": [],
+  "connected_only": false,
+  "base_url": "https://api.extremecloudiq.com",
+  "out": ""
+}
