@@ -56,8 +56,6 @@ A known-good access point, AP-EXAMPLE-01 serial `XXXXXXXXXXXXXX`, resolves as:
 - `wifi1.1` = `aa:bb:cc:00:00:64` with SSID `EXAMPLE-SSID-1`
 - `wifi1.2` = `aa:bb:cc:00:00:65` with SSID `EXAMPLE-SSID-2`
 
-`Notes` may say `API radio MAC aa:bb:cc:00:00:64 is wifi1.1` on the `wifi1.0` row. That note is expected.
-
 ## Do not publish
 
 Do not commit `.env`, `response_*.json`, `*.csv`, or `LOCAL_HANDOFF.md`. Do not put the token in `config.json`, the README, or a commit message.

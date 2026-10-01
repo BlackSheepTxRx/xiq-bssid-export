@@ -75,7 +75,6 @@ COLUMNS = (
     "SSID Status",
     "Network Policy",
     "Location Source",
-    "Notes",
 )
 
 _HEX_MAC = re.compile(r"[^0-9a-f]")
@@ -846,7 +845,6 @@ def _base_row(ap: Mapping[str, Any]) -> dict[str, str]:
         "SSID Status": "",
         "Network Policy": "",
         "Location Source": ap["location_source"],
-        "Notes": "",
     }
 
 
@@ -881,8 +879,6 @@ def _choice_row(
     reported_name: str,
     choice: InterfaceChoice,
     interface_mac: str,
-    api_mac: str,
-    api_index: int | None,
     wlan: Mapping[str, Any] | None,
     bssid: str,
 ) -> dict[str, str]:
@@ -898,20 +894,6 @@ def _choice_row(
         row["SSID"] = _ssid_name(wlan)
         row["SSID Status"] = "" if status is None else str(status)
         row["Network Policy"] = "" if policy is None else str(policy)
-    notes: list[str] = []
-    if not interface_mac:
-        notes.append(f"no {choice.radio} MAC reported")
-    elif api_index is None and api_mac:
-        notes.append(
-            f"API radio MAC {api_mac} is outside the {reported_name} address block"
-        )
-        if choice.bss > 0:
-            notes.append(f"could not place {reported_name}.{choice.bss}")
-    elif choice.bss == 0 and api_index not in (None, 0):
-        notes.append(f"API radio MAC {api_mac} is {reported_name}.{api_index}")
-    elif choice.bss > 0 and wlan is None and bssid:
-        notes.append(f"no SSID reported on {reported_name}.{choice.bss}")
-    row["Notes"] = "; ".join(notes)
     return row
 
 
@@ -942,7 +924,6 @@ def rows_for_ap(
                 row["Radio"] = choice.radio
                 row["WLAN Index"] = str(choice.bss)
                 row["Inferred Subinterface"] = choice.label
-                row["Notes"] = f"no {choice.radio} radio reported"
                 rows.append(row)
             continue
         any_radio = True
@@ -965,8 +946,6 @@ def rows_for_ap(
                         reported_name=reported_name,
                         choice=choice,
                         interface_mac=interface_mac,
-                        api_mac=api_mac,
-                        api_index=api_index,
                         wlan=wlan,
                         bssid=bssid,
                     )

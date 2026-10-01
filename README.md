@@ -86,15 +86,15 @@ For each access point whose `device_function` is `AP`:
 3. Each requested interface is matched to the radio of the same name (`wifi1.0` and `wifi1.1` both use the `wifi1` radio).
 4. IQ Engine gives that radio a 16-address block aligned to a trailing `0`. That address is `wifiN.0`. `wifiN.1` is 4 higher. `wifiN.2` is 5 higher. The API `mac_address` is `wifiN.0` when no SSID is up, and `wifiN.1` when one is. The script moves an address ending in `4` back to `0` before it applies the BSS index.
 5. `Radio MAC` is always `wifiN.0`. `BSSID` is the requested BSS. When a WLAN in the API uses that BSSID, its SSID, status, and network policy are written on the row.
-6. If the access point has no matching radio, one row is written per requested interface with the note `no wifi1 radio reported`.
+6. If the access point has no matching radio, one row is written per requested interface with the address columns left blank.
 
 `wifi1.0` on AP-EXAMPLE-01 is `aa:bb:cc:00:00:60`. The API returns `aa:bb:cc:00:00:64`, and `show interface` labels that address `Wifi1.1`.
 
 ## CSV columns
 
-Site, Building, Floor, AP Name, Serial, Model, Connected, Radio, Radio MAC, WLAN Index, Inferred Subinterface, SSID, BSSID, SSID Status, Network Policy, Location Source, Notes.
+Site, Building, Floor, AP Name, Serial, Model, Connected, Radio, Radio MAC, WLAN Index, Inferred Subinterface, SSID, BSSID, SSID Status, Network Policy, Location Source.
 
-`Inferred Subinterface` is the interface from `config.json`, such as `wifi1.0`. `WLAN Index` is the number after the dot. `Notes` records an API address that was not already the base, for example `API radio MAC aa:bb:cc:00:00:64 is wifi1.1`. `Location Source` is `tree` when the location tree identified the place, `breadcrumb-guess` when a breadcrumb id was missing from the tree, and `unassigned` when the access point has no location. Unassigned access points use the site name `(unassigned)`.
+`Inferred Subinterface` is the interface from `config.json`, such as `wifi1.0`. `WLAN Index` is the number after the dot. `Location Source` is `tree` when the location tree identified the place, `breadcrumb-guess` when a breadcrumb id was missing from the tree, and `unassigned` when the access point has no location. Unassigned access points use the site name `(unassigned)`.
 
 MAC addresses are written as lowercase colon-separated values.
 
